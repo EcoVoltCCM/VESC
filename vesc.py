@@ -1,27 +1,57 @@
 import pygame
 import serial
 import time
-from pyvesc import encode
+from pyvesc import encode, decode, encode_request
 from pyvesc.messages.setters import SetRPM
+from pyvesc.messages.getters import GetValues
 from pyvesc.messages.base import VESCMessage
 
 # ==========================================
 # PARCHE DEFINITIVO PARA EL BUG DE PYVESC
 # ==========================================
-# 1. Desalojamos la clase original defectuosa del registro interno
+# 1. Desalojamos las clases originales del registro interno
+if 4 in VESCMessage._msg_registry:
+    del VESCMessage._msg_registry[4]
 if 5 in VESCMessage._msg_registry:
     del VESCMessage._msg_registry[5]
 
-# 2. Registramos nuestra clase corregida
+# 2. Registramos nuestras clases corregidas (Layout para VESC FW 5.x/6.x)
 class SetDutyCycleCorregido(metaclass=VESCMessage):
-    id = 5  # El ID oficial del VESC para Duty Cycle
-    fields = [('duty_cycle', 'i')] # 'i' de Integer, sin multiplicadores automáticos
+    id = 5
+    fields = [('duty_cycle', 'i')]
+
+class GetValuesCorregido(metaclass=VESCMessage):
+    id = 4
+    fields = [
+        ('temp_fet', 'h', 10),
+        ('temp_motor', 'h', 10),
+        ('avg_motor_current', 'i', 100),
+        ('avg_input_current', 'i', 100),
+        ('avg_id', 'i', 100),
+        ('avg_iq', 'i', 100),
+        ('duty_now', 'h', 1000),
+        ('rpm', 'i', 1),
+        ('v_in', 'h', 10),
+        ('amp_hours', 'i', 10000),
+        ('amp_hours_charged', 'i', 10000),
+        ('watt_hours', 'i', 10000),
+        ('watt_hours_charged', 'i', 10000),
+        ('tachometer', 'i', 1),
+        ('tachometer_abs', 'i', 1),
+        ('mc_fault_code', 'c')
+    ]
 
 # ==========================================
 # CONFIGURACIÓN DEL SISTEMA
 # ==========================================
 PUERTO_VESC = 'COM3'
 EJE_ACELERADOR = 1
+
+# Configuración del Motor
+# El VESC reporta ERPM (RPM Eléctricas). 
+# RPM Reales = ERPM / Pares de Polos.
+# Si tu motor tiene 21 pares de polos:
+PARES_POLOS = 21 
 
 # Límite de potencia (Duty Cycle). Va de 0.0 a 1.0.
 LIMITE_POTENCIA = 1  # Puedes ajustar este valor para limitar la potencia máxima que envías al VESC  
@@ -51,6 +81,10 @@ print("SISTEMA ARMADO. Control por DUTY CYCLE (Bug Corregido).")
 print("Presiona Ctrl+C en esta ventana para PARO DE EMERGENCIA.")
 print("-" * 50)
 
+rpm_actual = 0
+v_in = 0.0
+i_motor = 0.0
+
 try:
     while True:
         pygame.event.pump()
@@ -79,11 +113,34 @@ try:
         # 4. Escalar a mano para el VESC y forzar el tipo Entero (Integer)
         duty_para_vesc = int(duty_objetivo * 100000)
         
-        # 5. Enviar usando nuestra clase parcheada
+        # 5. Enviar comando de Duty Cycle
         mensaje = SetDutyCycleCorregido(duty_para_vesc)
         conexion_vesc.write(encode(mensaje))
         
-        print(f"Multiplicador: {multiplicador_agresivo*100:04.1f}% | Pedal: {porcentaje_acelerador*100:03.0f}% | Mandando VESC: {duty_objetivo*100:04.1f}% Potencia", end='\r')
+        # 6. Solicitar telemetría (RPM, Voltaje, Corriente)
+        # Limpiamos el buffer de entrada para no leer datos viejos
+        conexion_vesc.reset_input_buffer()
+        conexion_vesc.write(encode_request(GetValuesCorregido))
+        
+        # 7. Leer respuesta (un pequeño delay ayuda a que el VESC responda)
+        time.sleep(0.01)
+        if conexion_vesc.in_waiting > 0:
+            try:
+                datos = conexion_vesc.read(conexion_vesc.in_waiting)
+                # Intentamos decodificar el paquete. unframe/decode manejará el checksum.
+                respuesta, consumido = decode(datos)
+                if respuesta:
+                    if hasattr(respuesta, 'rpm'):
+                        # Convertimos ERPM a RPM Mecánicas
+                        rpm_actual = respuesta.rpm / PARES_POLOS
+                    if hasattr(respuesta, 'v_in'):
+                        v_in = respuesta.v_in
+                    if hasattr(respuesta, 'avg_motor_current'):
+                        i_motor = respuesta.avg_motor_current
+            except Exception:
+                pass
+        
+        print(f"V: {v_in:4.1f}V | A: {i_motor:5.1f}A | RPM: {rpm_actual:6.0f} | Pedal: {porcentaje_acelerador*100:3.0f}% | VESC: {duty_objetivo*100:4.1f}%", end='\r')
         
         time.sleep(0.02)
 
